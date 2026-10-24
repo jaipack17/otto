@@ -1,0 +1,23 @@
+# Virtual environments. SGLang and vLLM never co-resolve in one env, so there
+# are deliberately two -- see docs/SERVING.md.
+.venv/
+.venv-sglang/
+
+# Third-party papers. Not ours to redistribute, and re-downloadable from the
+# arXiv links in docs/TASK_DESIGN.md. Fetch with:
+#   curl -sL -C - "https://arxiv.org/pdf/<id>" -o papers/<name>.pdf
+# (-C - resumes: arXiv served us truncated bodies more than once.)
+papers/
+
+# Generated artifacts
+data/rollouts/
+data/templates/accepted.jsonl
+*.sif
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS
+.DS_Store
