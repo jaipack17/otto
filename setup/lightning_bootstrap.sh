@@ -84,7 +84,7 @@ PY
 
 say "sandbox image"
 if docker info >/dev/null 2>&1; then
-  docker build -q -t terminal-rlvr-sandbox sandbox/ >/dev/null && echo "  built terminal-rlvr-sandbox"
+  docker build -q -t otto-sandbox sandbox/ >/dev/null && echo "  built otto-sandbox"
 else
   echo "  skipped (no daemon)"
 fi

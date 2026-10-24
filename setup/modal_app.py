@@ -22,7 +22,7 @@ Run order:
 
 import modal
 
-APP_NAME = "terminal-rlvr"
+APP_NAME = "otto"
 
 # A10G (24GB, Ampere) supports bf16 and flash-attention, unlike Kaggle's T4 (sm_75).
 GPU = "A10G"
@@ -35,7 +35,7 @@ SGLANG_VERSION = "0.5.20"
 SERVED_MODEL = "Qwen/Qwen3-0.6B"
 SGLANG_PORT = 8000
 
-vol = modal.Volume.from_name("terminal-rlvr-vol", create_if_missing=True)
+vol = modal.Volume.from_name("otto-vol", create_if_missing=True)
 VOL_PATH = "/vol"
 
 # --- images ------------------------------------------------------------------

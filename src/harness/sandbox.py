@@ -31,7 +31,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
-IMAGE = "terminal-rlvr-sandbox"
+IMAGE = "otto-sandbox"
 
 # Per-command wall clock. TMax allows 120s; ours are far smaller tasks and a
 # 0.6B policy mostly emits fast commands, so a short limit keeps rollouts cheap.

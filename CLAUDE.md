@@ -32,7 +32,7 @@ The repo is currently a **scaffold** — directory skeleton plus GPU bootstrap. 
 ./scripts/check_env.sh
 
 # build the throwaway execution sandbox
-docker build -t terminal-rlvr-sandbox sandbox/
+docker build -t otto-sandbox sandbox/
 
 # run one model-generated command against a fixture dir
 ./sandbox/run.sh 'find . -name "*.log" -delete' data/fixtures/some_task

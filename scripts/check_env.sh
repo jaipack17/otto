@@ -29,8 +29,8 @@ else
   echo "  then: VIRTUAL_ENV=.venv uv pip install 'auditkit[requests]' curatorkit"
 fi
 echo "=== docker sandbox image ==="
-docker image inspect terminal-rlvr-sandbox >/dev/null 2>&1 \
-  && echo "  terminal-rlvr-sandbox  built" \
-  || echo "  terminal-rlvr-sandbox  NOT BUILT -> docker build -t terminal-rlvr-sandbox sandbox/"
+docker image inspect otto-sandbox >/dev/null 2>&1 \
+  && echo "  otto-sandbox  built" \
+  || echo "  otto-sandbox  NOT BUILT -> docker build -t otto-sandbox sandbox/"
 echo "=== disk ==="
 df -h . | tail -1

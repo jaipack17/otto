@@ -18,4 +18,5 @@ ARGS=(
 )
 [ -n "$FIXTURE" ] && ARGS+=( -v "$(cd "$FIXTURE" && pwd):/work:rw" )
 
-timeout 10 docker run "${ARGS[@]}" terminal-rlvr-sandbox bash -c "$CMD"
+# NOTE: the image is now called otto-sandbox. This file is archived and not run.
+timeout 10 docker run "${ARGS[@]}" otto-sandbox bash -c "$CMD"
