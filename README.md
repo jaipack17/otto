@@ -1,5 +1,5 @@
 # otto
-![alt text](image.png)
+![otto in a terminal: it moves .tmp files and deletes empty files, showing a diff before applying](docs/images/otto-demo.png)
 A terminal agent built on **Qwen3-0.6B**, post-trained with reinforcement learning (GRPO) where the
 reward comes from actually running the model's shell commands in a Docker sandbox and checking the
 resulting filesystem. You describe a task in plain English; `otto` works out the commands, runs them
