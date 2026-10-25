@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Launch the terminal agent.  scripts/otto [--local|--url URL] [--dir DIR] ["task"]
+#   --local   use the model server on this Mac (start it first, see below)
+#   --url     an SGLang endpoint, e.g. the Colab tunnel:  https://xxxx.trycloudflare.com/v1
+set -euo pipefail
+cd "$(dirname "$0")/.."
+URL=${OTTO_URL:-http://127.0.0.1:30001/v1}
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local) URL=http://127.0.0.1:30001/v1; shift;;
+    --url) URL=$2; shift 2;;
+    *) ARGS+=("$1"); shift;;
+  esac
+done
+HF_HUB_OFFLINE=1 exec .venv-train/bin/python -m src.deploy.agent --url "$URL" ${ARGS[@]+"${ARGS[@]}"}

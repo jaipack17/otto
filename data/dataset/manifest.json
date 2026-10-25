@@ -1,0 +1,55 @@
+{
+  "templates_sha256": "c9130a066580e189d814833d7caa37382569ee8842d4bd77ef629849e232e7d0",
+  "seed_ranges": {
+    "train": [
+      1000,
+      1029
+    ],
+    "eval": [
+      900000,
+      900004
+    ]
+  },
+  "rows": {
+    "train": 1020,
+    "eval": 170
+  },
+  "distinct_prompts": 34,
+  "per_template_train": {
+    "count-logs": 30,
+    "delete-empty": 30,
+    "list-dats": 30,
+    "total-lines": 30,
+    "chmod-scripts": 30,
+    "stale-logs": 30,
+    "secure-keys": 30,
+    "purge-tmp": 30,
+    "truncate-logs": 30,
+    "split-by-status": 30,
+    "count-nested": 30,
+    "checksum-manifest": 30,
+    "flag-writable": 30,
+    "dedupe-report": 30,
+    "move-to-archive": 30,
+    "header-check": 30,
+    "largest-dat": 30,
+    "strip-blank-lines": 30,
+    "sum-ports": 30,
+    "highest-port": 30,
+    "delete-large": 30,
+    "list-hidden": 30,
+    "debug-enabled-list": 30,
+    "replace-in-place": 30,
+    "remove-world-write": 30,
+    "concat-parts": 30,
+    "list-executables": 30,
+    "delete-except-keep": 30,
+    "find-deep": 30,
+    "delete-only-in-logs-dir": 30,
+    "total-lines-tree": 30,
+    "largest-in-tree": 30,
+    "append-tree": 30,
+    "delete-dir": 30
+  },
+  "dropped": []
+}

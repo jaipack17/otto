@@ -1,0 +1,5 @@
+# vLLM has no macOS wheels, and AlignTune pins trl[vllm]; drop the extra, keep the pin.
+trl==1.7.1
+# PyICU needs the C++ ICU library to build. AlignTune imports it in exactly one place
+# (core/tokenization/vocab/continued_bpe.py, vocabulary extension), unused by GRPO.
+pyicu; sys_platform == "never"

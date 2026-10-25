@@ -38,6 +38,12 @@ IMAGE = "otto-sandbox"
 # ExecResult.timed_out makes it measurable -- raise it if traces show timeouts.
 DEFAULT_TIMEOUT = 10.0
 
+# Hard ceiling on a container's life, far above any episode (a few turns of seconds).
+MAX_LIFETIME = 3600
+
+# Where each command is staged before being sourced. /tmp is the sandbox's writable tmpfs.
+CMD_FILE = "/tmp/.otto_cmd"
+
 
 @dataclass
 class ExecResult:
@@ -82,6 +88,9 @@ class Sandbox:
         self._shell: Optional[subprocess.Popen] = None
         # Random per sandbox: a predictable sentinel could be forged by the model.
         self._marker = f"__END_{uuid.uuid4().hex[:12]}_"
+        # Heredoc terminator for passing a command to the shell as opaque text. Random
+        # per sandbox so no command can contain it by accident or on purpose.
+        self._eof = f"__OTTO_EOF_{uuid.uuid4().hex[:12]}__"
         # Per-command counter appended to the marker. A command that finishes late
         # (or a backgrounded one that writes after its sentinel) cannot then be
         # mistaken for the NEXT command's sentinel and desync every exit code.
@@ -110,9 +119,13 @@ class Sandbox:
         ]
         if self.user:
             cmd += ["--user", self.user]
-        # `sleep infinity` is the keepalive: without a foreground process the
-        # container exits immediately and there is nothing to exec into.
-        cmd += [self.image, "sleep", "infinity"]
+        # The keepalive: without a foreground process the container exits at once and
+        # there is nothing to exec into. It must NOT be `sleep infinity`: if the owning
+        # process is killed (a crash, a Ctrl-C, a stopped job) nothing runs `docker
+        # kill`, and an immortal container is stranded forever. We found three left
+        # behind for hours by a calibration run that was stopped mid-episode. With a
+        # finite lifetime and --rm, an orphan removes itself.
+        cmd += [self.image, "sleep", str(MAX_LIFETIME)]
 
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -182,22 +195,33 @@ class Sandbox:
         self._seq += 1
         marker = f"{self._marker}{self._seq}__"
 
-        # Wrap the command in a brace group with stderr merged.
+        # The command is written to a file through a QUOTED heredoc, then sourced.
         #
-        # Without this, a *redirection* failure is reported by bash itself rather
-        # than by a child process, and that diagnostic reaches the pipe AFTER our
-        # sentinel -- so `echo x > /read-only/path` returned exit 1 with empty
-        # output, losing "Read-only file system" entirely. Error text is exactly
-        # what the agent needs to react to and what River's error features match
-        # on, so losing it is not cosmetic.
+        # Why not send it to the shell directly? Because bash parses what it reads from
+        # stdin, and stdin here is our own protocol. A malformed command (an unclosed
+        # quote, a stray `done`, unbalanced braces) leaves bash waiting for the rest of
+        # a statement, so it swallows our sentinel as more of the command and the
+        # episode hangs until the timeout kills it: 7 of 68 early rollouts died this way,
+        # reward 0, with the model never told what it got wrong. A heredoc body is opaque
+        # to the parser, and `.` reads from a file rather than stdin, so a syntax error
+        # becomes an ordinary error message the model can learn from.
         #
-        # Braces, never parentheses: `{ ...; }` runs in the CURRENT shell, so
-        # `cd` and `export` still persist across turns. `( ...; )` would fork a
-        # subshell and silently break the persistent-state guarantee.
+        # `.` (source) runs in the CURRENT shell, so cd/export/functions still persist
+        # across turns -- a subshell or `bash file` would silently break that.
         #
-        # A bare newline before the command protects against a previous command
-        # having left a partial line on stdin.
-        payload = f"\n{{\n{command}\n}} 2>&1\necho \"{marker}$?\"\n"
+        # `2>&1` merges stderr inside the group: a failed redirection or a syntax error
+        # is reported by bash itself and would otherwise reach the pipe AFTER our
+        # sentinel and be lost (an earlier version dropped "Read-only file system").
+        #
+        # `< /dev/null` gives the command EOF on stdin: without it a bare `cat` swallowed
+        # the sentinel and every later command, silently (exit -1, output = our own
+        # wrapper text), and `grep pat` with no file hung. Heredocs inside the command
+        # are unaffected, their body is part of the command text.
+        #
+        # A leading newline protects against a partial line left by a previous command.
+        payload = (f"\ncat > {CMD_FILE} <<'{self._eof}'\n{command}\n{self._eof}\n"
+                   f"{{ . {CMD_FILE}; }} 2>&1 < /dev/null\n"
+                   f"echo \"{marker}$?\"\n")
         try:
             self._shell.stdin.write(payload.encode())
             self._shell.stdin.flush()

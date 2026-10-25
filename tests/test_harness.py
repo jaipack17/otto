@@ -13,7 +13,10 @@ import time
 import pytest
 
 from src.harness.episode import (
+    DONE_HINT,
+    EpisodeRun,
     FORMAT_REMINDER,
+    SYSTEM_PROMPT,
     Episode,
     copy_fixture,
     format_observation,
@@ -364,3 +367,188 @@ def test_mode_round_trip_through_bind_mount(tmp_path):
         f"owner-write was NOT forced on (host mode {host:04o}); this platform "
         "preserves restrictive modes, so mode-based tasks may use them"
     )
+
+
+# ====================================================== <done> is not offered early
+
+def test_done_absent_from_system_prompt():
+    # A 0.6B policy picks from what it was shown: offered <done> on turn one it
+    # took it in 19 of 32 episodes having run nothing; with it absent, 0 of 36.
+    assert "done" not in SYSTEM_PROMPT.lower()
+
+
+def test_done_absent_from_format_reminder():
+    # The reminder fires after an unparseable FIRST reply, so mentioning <done>
+    # would re-invite it on exactly the turn we are protecting.
+    assert "done" not in FORMAT_REMINDER.lower()
+
+
+@needs_docker
+def test_done_first_offered_in_an_observation():
+    ep = run_episode(TASK, FIXTURE, scripted("<command>ls</command>", "<done></done>"))
+    before_first_command = [m["content"] for m in ep.messages[:2]]       # system + task
+    assert not any("<done>" in c for c in before_first_command)
+    observations = [m["content"] for m in ep.messages if m["role"] == "user"][1:]
+    assert observations and all(DONE_HINT in o for o in observations)
+
+
+@needs_docker
+def test_done_still_accepted_unprompted():
+    # We stop inviting <done>, not honouring it.
+    ep = run_episode(TASK, FIXTURE, scripted("<done></done>"))
+    assert ep.stop_reason == "done"
+
+
+# =============================================================== EpisodeRun directly
+
+@needs_docker
+def test_run_step_returns_the_next_message_until_the_end():
+    run = EpisodeRun(TASK, FIXTURE).start()
+    try:
+        obs = run.step("<command>ls</command>")
+        assert obs is not None and DONE_HINT in obs and not run.finished
+        assert run.messages[-1] == {"role": "user", "content": obs}
+        assert run.step("<done></done>") is None and run.finished
+        assert run.finish().stop_reason == "done"
+    finally:
+        run.close()
+
+
+@needs_docker
+def test_run_ends_on_max_turns_and_still_records_the_last_observation():
+    run = EpisodeRun(TASK, FIXTURE).start()
+    try:
+        last = None
+        for _ in range(TASK.max_turns):
+            last = run.step("<command>true</command>")
+        assert last is None and run.finished            # nothing to feed back after the last turn
+        assert run.messages[-1]["role"] == "user"      # but the transcript still has it
+        assert run.finish().stop_reason == "max_turns"
+    finally:
+        run.close()
+
+
+@needs_docker
+def test_run_abort_sets_the_reason_and_still_scores():
+    run = EpisodeRun(TASK, FIXTURE).start()
+    run.step("<command>true</command>")
+    run.abort("too_long")
+    ep = run.finish()
+    assert ep.stop_reason == "too_long" and ep.result is not None
+
+
+@needs_docker
+def test_run_abort_does_not_overwrite_an_earlier_ending():
+    run = EpisodeRun(TASK, FIXTURE).start()
+    try:
+        run.step("<done></done>")
+        run.abort("too_long")
+        assert run.finish().stop_reason == "done"
+    finally:
+        run.close()
+
+
+@needs_docker
+def test_run_close_is_idempotent_and_removes_the_working_copy():
+    run = EpisodeRun(TASK, FIXTURE).start()
+    root = run._root
+    assert os.path.isdir(root)
+    run.close(); run.close()
+    assert not os.path.exists(root)
+
+
+@needs_docker
+def test_run_finish_is_idempotent():
+    run = EpisodeRun(TASK, FIXTURE).start()
+    run.step("<done></done>")
+    assert run.finish() is run.finish()
+
+
+@needs_docker
+def test_run_accepts_a_preset_conversation():
+    # TRL hands the rollout its prompts already as message lists.
+    preset = [{"role": "system", "content": "S"}, {"role": "user", "content": TASK.instruction}]
+    run = EpisodeRun(TASK, FIXTURE, messages=preset).start()
+    try:
+        assert run.messages[0]["content"] == "S"
+        run.messages.append({"role": "user", "content": "x"})
+        assert len(preset) == 2, "the caller's list must not be mutated"
+    finally:
+        run.close()
+
+
+def test_run_step_before_start_is_an_error():
+    with pytest.raises(RuntimeError):
+        EpisodeRun(TASK, FIXTURE).step("<command>ls</command>")
+
+
+@needs_docker
+def test_the_container_keepalive_has_a_finite_lifetime(tmp_path):
+    """An orphaned container (its owner killed before it could `docker kill`) must
+    expire by itself. Three were once stranded for hours by `sleep infinity`."""
+    from src.harness.sandbox import MAX_LIFETIME
+    with Sandbox(str(tmp_path)) as sb:
+        cmd = subprocess.run(["docker", "inspect", "--format", "{{.Config.Cmd}}", sb._cid],
+                             capture_output=True, text=True).stdout
+    assert "infinity" not in cmd and str(MAX_LIFETIME) in cmd, cmd
+
+
+@needs_docker
+@pytest.mark.parametrize("cmd,code", [("cat", 0), ("grep -i x", 1), ("read v", 1), ("wc -l", 0), ("sort", 0)])
+def test_commands_that_read_stdin_get_eof_and_cannot_hijack_the_shell(tmp_path, cmd, code):
+    """Regression. Every command used to inherit the shell's stdin -- the pipe carrying
+    our own protocol lines -- so a bare `cat` swallowed the sentinel and every later
+    command, silently (exit -1, output = our own wrapper text, dead=None), and
+    `grep pat` with no file hung the episode. Found in rollout traces."""
+    with Sandbox(str(tmp_path), timeout=5.0) as sb:
+        res = sb.exec(cmd)
+        assert not res.timed_out and sb.dead is None, res
+        assert res.exit_code == code, res
+        after = sb.exec("echo still-here")                   # the shell must NOT be hijacked
+        assert after.stdout == "still-here" and after.exit_code == 0, after
+
+
+@needs_docker
+def test_heredocs_still_work_with_stdin_closed(tmp_path):
+    with Sandbox(str(tmp_path)) as sb:
+        res = sb.exec("cat <<'EOF' > made.txt\nhello\nEOF\ncat made.txt")
+        assert res.stdout == "hello" and res.exit_code == 0, res
+
+
+@needs_docker
+@pytest.mark.parametrize("cmd", [
+    "echo 'abc",                     # unclosed quote
+    "find . | done",                 # stray token
+    "if true; then echo x",          # unterminated if
+    "echo $(",                       # unterminated substitution
+    "{ echo hi",                     # unbalanced brace
+])
+def test_malformed_syntax_returns_an_error_instead_of_killing_the_episode(tmp_path, cmd):
+    """Regression. A malformed command left bash waiting for the rest of a statement, so
+    it swallowed our sentinel and the episode hung until the timeout killed it: 7 of 68
+    early rollouts died this way, reward 0, the model never told what it got wrong. A
+    command is now sourced from a file, so a syntax error is an ordinary error message."""
+    with Sandbox(str(tmp_path), timeout=5.0) as sb:
+        res = sb.exec(cmd)
+        assert not res.timed_out and sb.dead is None, res
+        assert res.exit_code != 0
+        assert "syntax error" in res.stdout or "unexpected EOF" in res.stdout, res.stdout
+        assert sb.exec("echo next").stdout == "next"          # the shell is still usable
+
+
+@needs_docker
+def test_sourcing_a_command_keeps_cd_and_export_persistent(tmp_path):
+    # `.` runs in the CURRENT shell. A subshell or `bash file` would silently break this.
+    (tmp_path / "sub").mkdir()
+    with Sandbox(str(tmp_path)) as sb:
+        sb.exec("cd sub\nexport KEPT=yes")
+        assert sb.exec("pwd").stdout == "/work/sub"
+        assert sb.exec("echo $KEPT").stdout == "yes"
+
+
+@needs_docker
+def test_a_long_multiline_command_arrives_intact(tmp_path):
+    big = "x" * 6000
+    with Sandbox(str(tmp_path)) as sb:
+        res = sb.exec(f"echo {big}\necho second")
+        assert res.stdout == big + "\\nsecond".replace("\\n", "\\n") or res.stdout.splitlines() == [big, "second"]

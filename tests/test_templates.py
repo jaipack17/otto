@@ -258,3 +258,58 @@ def test_every_template_is_accepted():
     results = screen_all(ALL, seeds=SEEDS, n_random_cheats=10)
     bad = [r for r in results if not r.accepted]
     assert not bad, "\n".join(r.render() for r in bad)
+
+
+def test_selector_inside_a_list_flattens_next_to_literals():
+    from src.tasks.template import _resolve
+    facts = {"paths": {"t": ["a/x.tmp", "a/y.tmp"]}, "lines": {}, "ints": {}}
+    assert _resolve(["a", {"tag": "t"}, "b"], facts) == ["a", "a/x.tmp", "a/y.tmp", "b"]
+    assert _resolve({"tag": "t"}, facts) == ["a/x.tmp", "a/y.tmp"]          # bare form unchanged
+    assert _resolve([{"count_of_tag": "t"}], facts) == [2]                  # scalars stay as they are
+    assert _resolve([{"kind": "equals", "text": {"count_of_tag": "t"}}], facts) \
+        == [{"kind": "equals", "text": 2}]                                  # check specs untouched
+
+
+def test_content_state_ignores_modes_but_not_content(tmp_path):
+    import os
+    from src.tasks import screen
+    a, b = tmp_path / "a", tmp_path / "b"
+    for d in (a, b):
+        d.mkdir()
+        (d / "x.txt").write_text("same")
+    os.chmod(a / "x.txt", 0o600)
+    os.chmod(b / "x.txt", 0o644)
+    assert screen.content_state(str(a)) == screen.content_state(str(b))
+    (b / "x.txt").write_text("different")
+    assert screen.content_state(str(a)) != screen.content_state(str(b))
+
+
+def test_recording_captures_the_state_of_the_scored_run(tmp_path):
+    import random
+    from src.tasks import screen
+    state_rng = random.Random(1)
+
+    def stateful_cheat(root):                    # like random_cheats: a different file each call
+        open(f"{root}/f{state_rng.randrange(10**6)}", "w").close()
+
+    root = tmp_path / "root"
+    root.mkdir()
+    action, held = screen.recording(stateful_cheat)
+    action(str(root))
+    assert set(held["state"]) == {p.name for p in root.iterdir()}   # what ran is what was recorded
+    action2, held2 = screen.recording(stateful_cheat)
+    action2(str(root))
+    assert held2["state"] != held["state"]                           # a second run really differs
+
+
+def test_recording_still_captures_state_when_the_cheat_fails(tmp_path):
+    from src.tasks import screen
+
+    def boom(root):
+        open(f"{root}/partial", "w").close()
+        raise OSError("refused")
+
+    action, held = screen.recording(boom)
+    with pytest.raises(OSError):
+        action(str(tmp_path))
+    assert "partial" in held["state"]

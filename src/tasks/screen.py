@@ -34,9 +34,10 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..harness.episode import run_reference
-from ..harness.sandbox import IMAGE
+from ..harness.episode import _force_rmtree, copy_fixture, run_reference
+from ..harness.sandbox import IMAGE, Sandbox
 from ..verifier.cheats import from_dir, known_cheats, random_cheats, score_action
+from ..verifier.state import snapshot
 from ..verifier.task import TaskError
 from .template import TaskTemplate, load_templates
 
@@ -58,6 +59,41 @@ def docker_available(image: str = IMAGE) -> bool:
         if attempt < 2:
             subprocess.run(["docker", "info"], capture_output=True, timeout=30)
     return False
+
+
+def content_state(root: str) -> dict:
+    """What a filesystem holds, ignoring permission bits. Docker Desktop forces the
+    owner-write bit on bind mounts, so modes differ between a container run and a host
+    run of the very same commands; kind and content do not."""
+    return {p: (e.kind, e.sha256, e.target) for p, e in snapshot(root).items()}
+
+
+def reference_state(spec, fixture_src: str, image: str = IMAGE) -> dict:
+    """Final filesystem after the task's own reference solution, run in the sandbox."""
+    root = tempfile.mkdtemp(prefix="refstate-")
+    try:
+        copy_fixture(fixture_src, root)
+        with Sandbox(root, image=image, timeout=60.0) as sb:
+            for command in spec.reference:
+                sb.exec(command)
+        return content_state(root)
+    finally:
+        _force_rmtree(root)
+
+
+def recording(action):
+    """Wrap a cheat so the filesystem it leaves behind is captured during the same run
+    that gets scored. Random cheats hold a stateful RNG, so running one twice applies a
+    different mutation the second time; recording and scoring must be one application."""
+    holder: dict = {}
+
+    def wrapped(root: str) -> None:
+        try:
+            action(root)
+        finally:
+            holder["state"] = content_state(root)
+
+    return wrapped, holder
 
 
 @dataclass
@@ -177,9 +213,23 @@ def screen(
                 cheats = known_cheats(spec) + random_cheats(
                     spec, n=n_random_cheats, seed=seed)
                 out.cheats_run = len(cheats)
+                ref_state = None
                 for c in cheats:
-                    r = score_action(spec, build, c.apply).reward
-                    if r > 0.0:
+                    action, held = recording(c.apply)
+                    r = score_action(spec, build, action).reward
+                    if r <= 0.0:
+                        continue
+                    # A random mutation can land on the real solution (for instance by
+                    # picking `rm` of the one directory the task asks to delete). If its
+                    # final filesystem is identical to the reference's, it is a correct
+                    # answer reached by luck, not an exploit, so it is not a defect.
+                    if ref_state is None:
+                        ref_state = reference_state(spec, root, image)
+                    if held.get("state") == ref_state:
+                        res.warnings.append(
+                            f"seed {seed}: random cheat {c.label!r} is an accidental "
+                            "solution (same final state as the reference)")
+                    else:
                         out.escaped.append((c.label, r))
                 for label, r in out.escaped:
                     res.rejections.append(

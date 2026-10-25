@@ -16,7 +16,8 @@ right files *among* the wrong ones, the reward would be paying for collateral
 damage -- so an unexpected change is fatal, not a deduction.
 
 Checks are declarative JSON rather than Python callables because tasks have to
-round-trip through JSONL and parquet: they come out of CuratorKit, live in a HF
+round-trip through JSONL and parquet: they are data files (hand-written so far;
+generated ones were the plan), can live in a HF
 dataset, and reach AlignTune as dataset columns. A callable cannot be stored in
 a parquet file. New check kinds are one decorated function in the registry below.
 

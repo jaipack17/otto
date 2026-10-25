@@ -2,6 +2,7 @@
 # are deliberately two -- see docs/SERVING.md.
 .venv/
 .venv-sglang/
+.venv-train/
 
 # Third-party papers. Not ours to redistribute, and re-downloadable from the
 # arXiv links in docs/TASK_DESIGN.md. Fetch with:
@@ -21,3 +22,11 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Training outputs (checkpoints, adapters, logs)
+runs/
+
+# Local-only: merged model weights (1+ GB), practice folder (rebuilt by scripts/make_playground.sh), screenshots
+deploy/
+playground/
+image.png

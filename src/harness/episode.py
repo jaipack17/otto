@@ -36,21 +36,45 @@ from .sandbox import DEFAULT_TIMEOUT, IMAGE, Sandbox
 # Takes the conversation so far, returns the model's raw completion text.
 Policy = Callable[[list[dict]], str]
 
-SYSTEM_PROMPT = """You are working in a Linux shell. The current directory is /work.
+SYSTEM_PROMPT = """You are an expert Linux shell agent. Your working directory is /work, and every file you need is inside it.
 
-Reply with your reasoning, then exactly ONE command:
+Tools available: ls, cat, head, tail, find, grep, sed, awk, sort, uniq, wc, cut, tr, xargs, mv, cp, rm, mkdir, chmod. There is no internet, and no Python or compiler.
 
-<think>why this command</think>
+Reply with exactly ONE command per turn, wrapped in tags:
 <command>ls -la</command>
+You will see its output and exit status, then you may send the next command.
 
-You will see the command's output, then you may send another command.
-When the task is complete, reply with <done></done> instead of a command."""
+How to work:
+1. Look first. List the files before changing anything.
+2. Use paths relative to /work, and write any output file inside /work.
+3. If a command fails or the output is unexpected, change your approach instead of repeating it.
+4. After you modify files, check the result with ls or cat.
+
+Think concisely. Pinpoint the exact tool needed within 3 sentences."""
+
+# Chosen after drafting three variants (a terse one, a medium one and this detailed one,
+# minus its rule about quoting patterns). Constraints that shaped it, each measured:
+#   * <done> must never appear here. Offered on turn one, a 0.6B model took it in 19 of 32
+#     episodes having run nothing; "never reply <done> first" did not help. DONE_HINT below
+#     introduces it only after a command has run.
+#   * The conciseness line moved the model's thinking from "hit the 256-token cap" in 14 of
+#     16 rollouts to 4 of 16 (a 16-rollout probe, so indicative only).
+#   * Length has a price: every SFT example and every RL context re-reads the system prompt.
+# The SAME text must be used for training and for evaluation; a policy behaves as it was
+# trained to only under the prompt it saw.
 
 # Sent back when we cannot find an action. Short and literal: a 0.6B policy needs
-# the format restated, not an explanation of what it did wrong.
+# the format restated, not an explanation of what it did wrong. No mention of <done>:
+# this fires after an unparseable FIRST reply, which is exactly the turn it must not
+# be offered on.
 FORMAT_REMINDER = """No command found. Reply in exactly this form:
-<command>your command here</command>
-or <done></done> if the task is finished."""
+<command>your command here</command>"""
+
+# Appended to every observation, so <done> is only ever offered after a command ran.
+# The parser still accepts <done> on any turn; we just stop inviting it. Untested risk:
+# the model may now answer <done> straight after its first observation (River's
+# premature_done) -- the calibration pilot measures that.
+DONE_HINT = "\n(When the task is complete, reply <done></done> instead of a command.)"
 
 OBS_LIMIT = 2000           # characters of command output shown to the model
 MAX_PARSE_FAILURES = 2     # consecutive unparseable turns before we give up
@@ -218,6 +242,171 @@ def _force_rmtree(root: str) -> None:
 
 # --- the loop ----------------------------------------------------------------
 
+class EpisodeRun:
+    """One episode as a state machine.
+
+    The same parsing, execution and verification must serve two callers: the simple
+    loop below (a Policy callable, one episode at a time) and the batched,
+    token-level rollout in rollout.py (many episodes advanced in lock-step). Two
+    copies of this logic would drift apart, and a rollout that scores differently
+    from the evaluation loop would make every training number meaningless. So there
+    is exactly one, and both drive it:
+
+        run = EpisodeRun(task, fixture_src)
+        run.start()
+        while not run.finished:
+            observation = run.step(raw_completion)   # None once the episode is over
+        episode = run.finish()
+
+    `step` returns the text of the next user message (an observation, or the format
+    reminder after an unparseable reply) while the episode continues, and None when
+    it has just ended. Whatever the ending, that message is still appended to
+    `messages`, which keeps the transcript identical to the pre-refactor loop.
+    """
+
+    def __init__(
+        self,
+        task: TaskSpec,
+        fixture_src: str,
+        *,
+        messages: Optional[list[dict]] = None,
+        image: str = IMAGE,
+        timeout: float = DEFAULT_TIMEOUT,
+        obs_limit: int = OBS_LIMIT,
+        max_parse_failures: int = MAX_PARSE_FAILURES,
+        graded: bool = False,
+        system_prompt: str = SYSTEM_PROMPT,
+    ) -> None:
+        self.task, self.fixture_src = task, fixture_src
+        self.image, self.timeout = image, timeout
+        self.obs_limit, self.max_parse_failures = obs_limit, max_parse_failures
+        self.graded = graded
+
+        self.ep = Episode(task_id=task.id)
+        # A caller that already templated the conversation (TRL hands the rollout its
+        # prompts as message lists) passes it in; otherwise build the standard opening.
+        self.ep.messages = [dict(m) for m in messages] if messages is not None else [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task.instruction},
+        ]
+        self.messages, self.turns = self.ep.messages, self.ep.turns
+
+        self._root: Optional[str] = None
+        self._sandbox: Optional[Sandbox] = None
+        self._before: Optional[dict] = None
+        self._parse_failures = 0
+        self._turns_taken = 0
+        self._finished = False
+        self._result: Optional[Episode] = None
+
+    # --- lifecycle ----------------------------------------------------------
+
+    def start(self) -> "EpisodeRun":
+        self._root = tempfile.mkdtemp(prefix="episode-")
+        try:
+            copy_fixture(self.fixture_src, self._root)
+            self._before = snapshot(self._root)
+            self._sandbox = Sandbox(self._root, image=self.image, timeout=self.timeout).start()
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    def abort(self, reason: str) -> None:
+        """End the episode from outside (e.g. the token budget ran out)."""
+        if not self._finished:
+            self.ep.stop_reason = reason
+            self._finished = True
+
+    def _end(self, reason: str) -> None:
+        self.ep.stop_reason = reason
+        self._finished = True
+
+    def step(self, raw: str) -> Optional[str]:
+        """Feed one raw completion. Returns the next user message, or None if over."""
+        if self._finished:
+            return None
+        if self._sandbox is None:
+            raise RuntimeError("EpisodeRun.step called before start()")
+
+        self._turns_taken += 1
+        self.messages.append({"role": "assistant", "content": raw})
+        think, command, done, err = parse_action(raw)
+        self.turns.append(Turn("assistant", raw, command=command,
+                               think=think, parse_error=err, done=done))
+
+        if done:
+            self._end("done")
+            return None
+
+        if command is None:
+            self._parse_failures += 1
+            if self._parse_failures >= self.max_parse_failures:
+                self._end("parse_failures")
+                return None
+            self.messages.append({"role": "user", "content": FORMAT_REMINDER})
+            self.turns.append(Turn("tool", FORMAT_REMINDER))
+            return self._after_turn(FORMAT_REMINDER)
+
+        self._parse_failures = 0
+        res = self._sandbox.exec(command)
+        body, was_truncated = truncate(res.stdout, self.obs_limit)
+        obs = format_observation(body, res.exit_code, res.timed_out,
+                                 res.duration, was_truncated) + DONE_HINT
+        self.messages.append({"role": "user", "content": obs})
+        self.turns.append(Turn("tool", obs, exit_code=res.exit_code,
+                               timed_out=res.timed_out, truncated=was_truncated))
+        if self._sandbox.dead:
+            self._end("sandbox_dead")
+            return None
+        return self._after_turn(obs)
+
+    def _after_turn(self, message: str) -> Optional[str]:
+        if self._turns_taken >= self.task.max_turns:
+            self._end("max_turns")
+            return None
+        return message
+
+    def finish(self) -> Episode:
+        """Tear down, then score. The final snapshot is taken AFTER the container is
+        gone so every write has flushed and nothing can mutate the tree between
+        snapshot and verification. Idempotent."""
+        if self._result is not None:
+            return self._result
+        if self._root is None or self._before is None:
+            raise RuntimeError("EpisodeRun.finish called before start()")
+        if not self.ep.stop_reason:
+            self.ep.stop_reason = "max_turns"
+        self._finished = True
+        try:
+            if self._sandbox is not None:
+                self._sandbox.stop()
+                self._sandbox = None
+            after = snapshot(self._root)
+            self.ep.result = verify(self.task, self._root, self._before, after,
+                                    graded=self.graded)
+            self.ep.diff = state_diff(self._before, after).render()
+            self._result = self.ep
+            return self.ep
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Release the container and working copy. Safe to call any number of times."""
+        if self._sandbox is not None:
+            try:
+                self._sandbox.stop()
+            finally:
+                self._sandbox = None
+        if self._root is not None:
+            _force_rmtree(self._root)
+            self._root = None
+
+
 def run_episode(
     task: TaskSpec,
     fixture_src: str,
@@ -230,68 +419,21 @@ def run_episode(
     graded: bool = False,
     system_prompt: str = SYSTEM_PROMPT,
 ) -> Episode:
-    """Run one episode and score it.
+    """Run one episode against a Policy callable and score it.
 
     Stops on <done>, on max_turns, on a dead sandbox (a hung command), or after
-    `max_parse_failures` consecutive unparseable completions. The final snapshot
-    is taken AFTER the container is torn down so every write has landed.
+    `max_parse_failures` consecutive unparseable completions.
     """
-    ep = Episode(task_id=task.id)
-    root = tempfile.mkdtemp(prefix="episode-")
+    run = EpisodeRun(task, fixture_src, image=image, timeout=timeout,
+                     obs_limit=obs_limit, max_parse_failures=max_parse_failures,
+                     graded=graded, system_prompt=system_prompt)
     try:
-        copy_fixture(fixture_src, root)
-        before = snapshot(root)
-
-        ep.messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": task.instruction},
-        ]
-        ep.stop_reason = "max_turns"
-        parse_failures = 0
-
-        with Sandbox(root, image=image, timeout=timeout) as sb:
-            for _ in range(task.max_turns):
-                raw = policy(ep.messages)
-                ep.messages.append({"role": "assistant", "content": raw})
-
-                think, command, done, err = parse_action(raw)
-                ep.turns.append(Turn("assistant", raw, command=command,
-                                     think=think, parse_error=err, done=done))
-
-                if done:
-                    ep.stop_reason = "done"
-                    break
-
-                if command is None:
-                    parse_failures += 1
-                    if parse_failures >= max_parse_failures:
-                        ep.stop_reason = "parse_failures"
-                        break
-                    ep.messages.append({"role": "user", "content": FORMAT_REMINDER})
-                    ep.turns.append(Turn("tool", FORMAT_REMINDER))
-                    continue
-
-                parse_failures = 0
-                res = sb.exec(command)
-                body, was_truncated = truncate(res.stdout, obs_limit)
-                obs = format_observation(body, res.exit_code, res.timed_out,
-                                         res.duration, was_truncated)
-                ep.messages.append({"role": "user", "content": obs})
-                ep.turns.append(Turn("tool", obs, exit_code=res.exit_code,
-                                     timed_out=res.timed_out, truncated=was_truncated))
-
-                if sb.dead:
-                    ep.stop_reason = "sandbox_dead"
-                    break
-
-        # After the container is gone: every write has flushed, and nothing can
-        # mutate the tree between snapshot and verification.
-        after = snapshot(root)
-        ep.result = verify(task, root, before, after, graded=graded)
-        ep.diff = state_diff(before, after).render()
-        return ep
+        run.start()
+        while not run.finished:
+            run.step(policy(run.messages))
+        return run.finish()
     finally:
-        _force_rmtree(root)
+        run.close()
 
 
 def run_reference(

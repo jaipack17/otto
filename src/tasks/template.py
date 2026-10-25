@@ -21,7 +21,7 @@ Expectations are written as selectors over *tags* rather than literal paths:
     {"basenames_of_tag": "x"}   -> their basenames
 
 Recipes are declarative data, not Python, for the same reason checks are: a
-template is what CuratorKit generates and what round-trips through JSONL and
+template is the unit a generator would emit and must round-trip through JSONL and
 parquet, and a closure cannot live in a parquet cell.
 
 Stdlib only.
@@ -327,7 +327,18 @@ def _resolve(node: Any, facts: dict[str, Any]) -> Any:
             return [os.path.basename(p) for p in paths]
         return {k: _resolve(v, facts) for k, v in node.items()}
     if isinstance(node, list):
-        return [_resolve(v, facts) for v in node]
+        out: list[Any] = []
+        for v in node:
+            r = _resolve(v, facts)
+            # A selector standing among literals contributes its members, so
+            # ["cache", {"tag": "doomed"}] means "cache plus every doomed path", which
+            # is how a template names a deleted directory next to the files in it.
+            if isinstance(v, dict) and len(v) == 1 and next(iter(v)) in _SELECTORS \
+                    and isinstance(r, list):
+                out.extend(r)
+            else:
+                out.append(r)
+        return out
     return node
 
 
